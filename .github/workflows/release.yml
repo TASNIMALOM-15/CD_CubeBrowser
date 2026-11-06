@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  create:
+
+jobs:
+  release-automation:
+    name: Build App
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          submodules: 'true'
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Install Android SDK with pieces Gradle skips
+        run: bash ./automation/iceraven/install-sdk.sh
+
+      - name: Inspect memory
+        run: free -h
+
+      - name: Create version name
+        run: echo "VERSION_NAME=$(git describe --tags HEAD)" >> $GITHUB_ENV
+
+      - name: Patch on the fly
+        run: |
+          bash ./automation/iceraven/patch_android_components.sh
+          bash ./automation/iceraven/setup_venv.sh
+
+      - name: Relpace strings
+        run: |
+          sed -i 's/Firefox/Cube/g' app/src/*/res/values*/*strings.xml
+          sed -i '/about_content/s/Mozilla/@forkmaintainers/' app/src/*/res/values*/*strings.xml
+          sed -i '/<string name="trackers_blocked_panel_categorical_num_trackers_blocked">/s/%s/%1$s/g; /<string name="trackers_blocked_panel_categorical_num_trackers_blocked">/s/%d/%2$d/g' app/src/*/res/values*/*strings.xml
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Build forkRelease variant of app
+        env:
+          GRADLE_OPTS: -Dorg.gradle.jvmargs="-XX:MaxMetaspaceSize=4g -Xms1g -Xmx7g -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dev/stderr"
+        run: |
+          /usr/bin/time -v bash ./gradlew app:assembleForkRelease -PversionName=${{ env.VERSION_NAME }} --stacktrace --no-daemon
+
+      - name: Create signed APKs
+        uses: akliuxingyuan/sign-android-release@v2.0.1
+        with:
+          releaseDir: gradle/build/app/outputs/apk/forkRelease/
+          signingKey: ${{ secrets.DEBUG_SIGNING_KEY }}
+          keyAlias: ${{ secrets.DEBUG_ALIAS }}
+          keyStorePassword: ${{ secrets.DEBUG_KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.DEBUG_KEY_PASSWORD }}
+
+      - name: Create changelog
+        if: "contains(toJSON(github.event.ref_type), 'tag') && contains(toJSON(github.event.ref), 'iceraven')"
+        run: |
+          PREVIOUS_RELEASE_TAG=$(git tag --list iceraven-* --sort=-creatordate | tail -n+2 | head -n 1)
+          CURRENT_RELEASE_TAG=${{ github.event.ref }}
+          CURRENT_RELEASE_TAG_CAPITALIZE=${CURRENT_RELEASE_TAG^}
+          CURRENT_RELEASE_TAG_CAPITALIZE=$(echo $CURRENT_RELEASE_TAG_CAPITALIZE | tr '-' ' ')
+          echo "CURRENT_RELEASE_TAG_CAPITALIZE=${CURRENT_RELEASE_TAG_CAPITALIZE}" >> $GITHUB_ENV
+          FENIX_TAG=$(cat version.txt | tr -d '\n')
+
+          echo -e "## Release info\n" >> temp_changelog.md
+
+          echo '```' >> temp_changelog.md
+          echo "Iceraven: $(echo $CURRENT_RELEASE_TAG |  tr -d 'iceraven-')" >> temp_changelog.md
+          echo "Fenix: ${FENIX_TAG}" >> temp_changelog.md
+          echo -e '```\n' >> temp_changelog.md
+
+          echo -e "## News\n" >> temp_changelog.md
+
+          echo -e "## Change log\n" >> temp_changelog.md
+          echo "[${PREVIOUS_RELEASE_TAG}...${CURRENT_RELEASE_TAG}](https://github.com/${{ github.repository }}/compare/${PREVIOUS_RELEASE_TAG}...${CURRENT_RELEASE_TAG})" >> temp_changelog.md
+
+      - name: Rename APKs for Release
+        if: "contains(toJSON(github.event.ref_type), 'tag') && contains(toJSON(github.event.ref), 'iceraven')"
+        run: |
+          mkdir -p dist_apks
+          cp gradle/build/app/outputs/apk/forkRelease/app-arm64-v8a-forkRelease.apk dist_apks/${{ github.event.ref }}-arm64-v8a.apk
+          cp gradle/build/app/outputs/apk/forkRelease/app-armeabi-v7a-forkRelease.apk dist_apks/${{ github.event.ref }}-armeabi-v7a.apk
+
+      - name: Release and Upload APKs
+        if: "contains(toJSON(github.event.ref_type), 'tag') && contains(toJSON(github.event.ref), 'iceraven')"
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.event.ref }}
+          name: "${{ env.CURRENT_RELEASE_TAG_CAPITALIZE }}"
+          draft: false
+          prerelease: false
+          body_path: temp_changelog.md
+          files: dist_apks/*.apk
